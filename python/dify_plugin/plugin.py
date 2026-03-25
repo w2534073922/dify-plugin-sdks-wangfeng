@@ -525,10 +525,10 @@ class Plugin(IOServer, Router):
                         data=writer.stream_object(data=response),
                     )
         finally:
-            # Wait for all background tasks spawned by the plugin via
-            # session.run_in_background() before the session END is sent.
-            # This keeps session resources (invocations, storage, etc.) alive
-            # until every background thread has finished its work.
+            # 等待所有通过 session.run_in_background() 启动的后台任务完成，
+            # 之后再发送会话结束信号（END）给 Dify 守护进程。
+            # 这样可以保证后台线程在 _invoke 结束后仍能正常访问 session 资源
+            # （如 session.storage、session.app.chat.invoke 等）。
             session._wait_for_background_tasks()
 
     @staticmethod
