@@ -1,6 +1,8 @@
+import logging
+import threading
 import uuid
 from abc import ABC
-from collections.abc import Generator, Mapping
+from collections.abc import Callable, Generator, Mapping
 from concurrent.futures import ThreadPoolExecutor
 from enum import Enum
 from typing import Any, Generic, TypeVar, Union
@@ -158,8 +160,88 @@ class Session:
         # max invocation timeout (seconds)
         self.max_invocation_timeout: int = max_invocation_timeout
 
+        # 后台任务追踪列表及其锁
+        # 用于记录通过 run_in_background() 启动的所有后台线程
+        self._background_tasks: list[threading.Thread] = []
+        self._background_tasks_lock: threading.Lock = threading.Lock()
+
         # register invocations
         self._register_invocations()
+
+    def run_in_background(self, func: Callable, *args: Any, **kwargs: Any) -> threading.Thread:
+        """
+        在后台线程中运行一个函数，并由当前 Session 追踪该线程的生命周期。
+
+        **解决的问题**：当插件的 ``_invoke`` 方法结束（生成器耗尽）后，Dify 守护进程
+        会立即关闭会话。若你在 ``_invoke`` 中启动了普通的后台线程，该线程调用
+        ``session.storage``、``session.app.chat.invoke`` 等接口时，会因会话已关闭而报错。
+
+        通过此方法启动的后台线程会被 Session 追踪。插件执行器在发送会话结束信号之前，
+        会自动等待所有通过此方法注册的后台线程执行完毕，从而确保后台线程可以正常使用
+        所有 session 上下文资源（存储、模型调用、应用调用等）。
+
+        **使用示例**::
+
+            def _invoke(self, tool_parameters):
+                def background_task():
+                    # 即使 _invoke 已经 return，这里依然可以正常调用 session 资源
+                    result = self.session.storage.get("key")
+                    self.session.app.chat.invoke(...)
+
+                # 使用 run_in_background 而不是 threading.Thread
+                self.session.run_in_background(background_task)
+
+                yield self.create_text_message("后台任务已启动")
+
+        :param func: 要在后台线程中执行的可调用对象。
+        :param args: 传递给 ``func`` 的位置参数。
+        :param kwargs: 传递给 ``func`` 的关键字参数。
+        :returns: 已启动的 :class:`threading.Thread` 实例。
+        """
+        logger = logging.getLogger(__name__)
+
+        def _wrapper():
+            try:
+                func(*args, **kwargs)
+            except Exception:
+                logger.exception("后台任务执行时发生异常")
+            finally:
+                with self._background_tasks_lock:
+                    if thread in self._background_tasks:
+                        self._background_tasks.remove(thread)
+                    else:
+                        logger.debug(
+                            "后台任务线程 %s 不在 session %s 的任务列表中",
+                            thread.name,
+                            self.session_id,
+                        )
+
+        thread = threading.Thread(target=_wrapper, daemon=True)
+        with self._background_tasks_lock:
+            self._background_tasks.append(thread)
+        thread.start()
+        return thread
+
+    def _wait_for_background_tasks(self) -> None:
+        """
+        阻塞等待，直到本 Session 通过 :meth:`run_in_background` 注册的所有后台线程全部执行完毕。
+
+        此方法由插件执行器在 ``_invoke`` 生成器耗尽后自动调用，插件开发者无需手动调用。
+        """
+        logger = logging.getLogger(__name__)
+        # 循环等待，处理后台任务链式派生的情况（后台任务中再次调用 run_in_background）
+        while True:
+            with self._background_tasks_lock:
+                tasks = list(self._background_tasks)
+            if not tasks:
+                break
+            for task in tasks:
+                task.join()
+            # join 之后再次检查，防止任务执行过程中又派生了新的后台任务
+            with self._background_tasks_lock:
+                if not self._background_tasks:
+                    break
+        logger.debug("Session %s 的所有后台任务已执行完毕", self.session_id)
 
     def _register_invocations(self) -> None:
         from dify_plugin.invocations.file import File

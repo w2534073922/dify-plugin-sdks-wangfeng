@@ -465,20 +465,39 @@ class Plugin(IOServer, Router):
             context=context,
             max_invocation_timeout=self.config.MAX_INVOCATION_TIMEOUT,
         )
-        response = self.dispatch(session, data)
-        if response:
-            if isinstance(response, Generator):
-                for message in response:
-                    if isinstance(message, ToolInvokeMessage) and isinstance(
-                        message.message, ToolInvokeMessage.BlobMessage
-                    ):
-                        # convert blob to file chunks
-                        id_ = uuid.uuid4().hex
-                        blob = message.message.blob
-                        message.message.blob = id_.encode("utf-8")
-                        # split the blob into chunks
-                        chunks = [blob[i : i + 8192] for i in range(0, len(blob), 8192)]
-                        for sequence, chunk in enumerate(chunks):
+        try:
+            response = self.dispatch(session, data)
+            if response:
+                if isinstance(response, Generator):
+                    for message in response:
+                        if isinstance(message, ToolInvokeMessage) and isinstance(
+                            message.message, ToolInvokeMessage.BlobMessage
+                        ):
+                            # convert blob to file chunks
+                            id_ = uuid.uuid4().hex
+                            blob = message.message.blob
+                            message.message.blob = id_.encode("utf-8")
+                            # split the blob into chunks
+                            chunks = [blob[i : i + 8192] for i in range(0, len(blob), 8192)]
+                            for sequence, chunk in enumerate(chunks):
+                                writer.session_message(
+                                    session_id=session_id,
+                                    data=writer.stream_object(
+                                        data=ToolInvokeMessage(
+                                            type=ToolInvokeMessage.MessageType.BLOB_CHUNK,
+                                            message=ToolInvokeMessage.BlobChunkMessage(
+                                                id=id_,
+                                                sequence=sequence,
+                                                total_length=len(blob),
+                                                blob=chunk,
+                                                end=False,
+                                            ),
+                                            meta=message.meta,
+                                        ),
+                                    ),
+                                )
+
+                            # end the file stream
                             writer.session_message(
                                 session_id=session_id,
                                 data=writer.stream_object(
@@ -486,43 +505,31 @@ class Plugin(IOServer, Router):
                                         type=ToolInvokeMessage.MessageType.BLOB_CHUNK,
                                         message=ToolInvokeMessage.BlobChunkMessage(
                                             id=id_,
-                                            sequence=sequence,
+                                            sequence=len(chunks),
                                             total_length=len(blob),
-                                            blob=chunk,
-                                            end=False,
+                                            blob=b"",
+                                            end=True,
                                         ),
                                         meta=message.meta,
-                                    ),
+                                    )
                                 ),
                             )
-
-                        # end the file stream
-                        writer.session_message(
-                            session_id=session_id,
-                            data=writer.stream_object(
-                                data=ToolInvokeMessage(
-                                    type=ToolInvokeMessage.MessageType.BLOB_CHUNK,
-                                    message=ToolInvokeMessage.BlobChunkMessage(
-                                        id=id_,
-                                        sequence=len(chunks),
-                                        total_length=len(blob),
-                                        blob=b"",
-                                        end=True,
-                                    ),
-                                    meta=message.meta,
-                                )
-                            ),
-                        )
-                    else:
-                        writer.session_message(
-                            session_id=session_id,
-                            data=writer.stream_object(data=message),
-                        )
-            else:
-                writer.session_message(
-                    session_id=session_id,
-                    data=writer.stream_object(data=response),
-                )
+                        else:
+                            writer.session_message(
+                                session_id=session_id,
+                                data=writer.stream_object(data=message),
+                            )
+                else:
+                    writer.session_message(
+                        session_id=session_id,
+                        data=writer.stream_object(data=response),
+                    )
+        finally:
+            # 等待所有通过 session.run_in_background() 启动的后台任务完成，
+            # 之后再发送会话结束信号（END）给 Dify 守护进程。
+            # 这样可以保证后台线程在 _invoke 结束后仍能正常访问 session 资源
+            # （如 session.storage、session.app.chat.invoke 等）。
+            session._wait_for_background_tasks()
 
     @staticmethod
     def _get_remote_install_host_and_port(config: DifyPluginEnv) -> tuple[str, int]:
