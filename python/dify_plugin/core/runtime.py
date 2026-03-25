@@ -1,6 +1,8 @@
+import logging
+import threading
 import uuid
 from abc import ABC
-from collections.abc import Generator, Mapping
+from collections.abc import Callable, Generator, Mapping
 from concurrent.futures import ThreadPoolExecutor
 from enum import Enum
 from typing import Any, Generic, TypeVar, Union
@@ -158,8 +160,84 @@ class Session:
         # max invocation timeout (seconds)
         self.max_invocation_timeout: int = max_invocation_timeout
 
+        # background task tracking
+        self._background_tasks: list[threading.Thread] = []
+        self._background_tasks_lock: threading.Lock = threading.Lock()
+
         # register invocations
         self._register_invocations()
+
+    def run_in_background(self, func: Callable, *args: Any, **kwargs: Any) -> threading.Thread:
+        """
+        Run a function in a background thread that is tracked by this session.
+
+        The session will wait for all background tasks registered via this method
+        to complete before sending the END signal to the Dify daemon. This keeps
+        session resources (invocations, storage, etc.) available until all
+        background work is done.
+
+        Usage::
+
+            def _invoke(self, tool_parameters):
+                def background_task():
+                    result = self.session.storage.get("key")
+                    self.session.app.chat.invoke(...)
+
+                self.session.run_in_background(background_task)
+                yield self.create_text_message("Background task started")
+
+        :param func: The callable to run in the background thread.
+        :param args: Positional arguments forwarded to *func*.
+        :param kwargs: Keyword arguments forwarded to *func*.
+        :returns: The started :class:`threading.Thread` instance.
+        """
+        logger = logging.getLogger(__name__)
+
+        def _wrapper():
+            try:
+                func(*args, **kwargs)
+            except Exception:
+                logger.exception("Background task raised an exception")
+            finally:
+                with self._background_tasks_lock:
+                    if thread in self._background_tasks:
+                        self._background_tasks.remove(thread)
+                    else:
+                        logger.debug(
+                            "Background task thread %s not found in task list for session %s",
+                            thread.name,
+                            self.session_id,
+                        )
+
+        thread = threading.Thread(target=_wrapper, daemon=True)
+        with self._background_tasks_lock:
+            self._background_tasks.append(thread)
+        thread.start()
+        return thread
+
+    def _wait_for_background_tasks(self) -> None:
+        """
+        Block until all background tasks registered with this session via
+        :meth:`run_in_background` have completed.
+
+        This is called automatically by the plugin executor after the main
+        ``_invoke`` generator is exhausted, so plugin authors do not need to
+        call it themselves.
+        """
+        logger = logging.getLogger(__name__)
+        # Iterate until no live tasks remain (handles cascading task spawns).
+        while True:
+            with self._background_tasks_lock:
+                tasks = list(self._background_tasks)
+            if not tasks:
+                break
+            for task in tasks:
+                task.join()
+            # After joining, check again — tasks may have added more tasks.
+            with self._background_tasks_lock:
+                if not self._background_tasks:
+                    break
+        logger.debug("All background tasks for session %s have completed", self.session_id)
 
     def _register_invocations(self) -> None:
         from dify_plugin.invocations.file import File
